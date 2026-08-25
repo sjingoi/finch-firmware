@@ -1,13 +1,17 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/sys/printk.h>
 #include <csp/csp.h>
 #include <csp/interfaces/csp_if_kiss.h>
+#include <csp/drivers/usart.h>
 
 #define SW0_NODE DT_ALIAS(sw0)
-#define UART_NODE DT_NODELABEL(uart1)
+#define UART_NODE DT_NODELABEL(usart1)
 #define SERVER_PORT 10
+#define UART_BAUDRATE 115200
 
 static const int32_t sleep_time_ms = 100;
 
@@ -26,11 +30,18 @@ K_THREAD_STACK_DEFINE(client_stack, 1024);
 // UART
 static const struct device *uart_dev = DEVICE_DT_GET(UART_NODE);
 
-static csp_iface_t iface = {0};
-static csp_kiss_interface_data_t kiss_data = {0};
+static csp_iface_t *iface = NULL;
+// static csp_kiss_interface_data_t kiss_data = {0};
 
 void callback(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins) {
     printk("Button state changed.\r\n");
+}
+
+void csp_print_func(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintk(fmt, args);
+    va_end(args);
 }
 
 void task_router(void *p1, void *p2, void *p3) {
@@ -77,10 +88,10 @@ void task_client(void *p1, void *p2, void *p3) {
 
     while (1) {
         k_msleep(2000);
-        // int server_address = 5;
-        // printf("Pinging...\r\n");
-        // int result = csp_ping(server_address, 1000, 100, CSP_O_NONE);
-        // printk("Ping address: %u, result %d [ms]\r\n", server_address, result);
+        int server_address = 1;
+        printf("Pinging...\r\n");
+        int result = csp_ping(server_address, 1000, 100, CSP_O_NONE);
+        printk("Ping address: %u, result %d [ms]\r\n", server_address, result);
     }
 }
 
@@ -136,49 +147,23 @@ int start_client() {
     return 0;
 }
 
-int uart_csp_tx(void *driver_data, const uint8_t * data, size_t len) {
-    printk("TX %d byte(s):", len);
-    for (size_t i = 0; i < len; i++) {
-        uart_poll_out(uart_dev, data[i]);
-    }
-    return CSP_ERR_NONE;
-}
-
-void uart_csp_rx(const struct device *dev, void *user_data) {
-    uint8_t buf[32];
-    int woken = 0;
-
-    if (!uart_irq_update(uart_dev) || !uart_irq_rx_ready(uart_dev))
-        return;
-    
-    int len;
-    while ((len = uart_fifo_read(dev, buf, sizeof(buf)))) {
-        printk("RX %d byte(s):", len);
-        for (int i = 0; i < len; i++) {
-            printk(" %02x", buf[i]);
-        }
-        printk("\r\n");
-        csp_kiss_rx(&iface, buf, len, &woken);
-    }
-}
-
 int main(void) {
 
     csp_init();
 
-    iface.name = "uart";
-    iface.addr = 5;
-    iface.is_default = 1;
-    iface.interface_data = &kiss_data;
-    kiss_data.tx_func = uart_csp_tx;
-
-    csp_kiss_add_interface(&iface);
+    csp_usart_conf_t uart_conf = {
+        .device = uart_dev->name,
+		.baudrate = UART_BAUDRATE,
+		.databits = 8,
+		.stopbits = 1,
+		.paritysetting = 0,
+	};
+    csp_usart_open_and_add_kiss_interface(&uart_conf, "uart", 5, &iface);
+    iface->is_default = 1;
 
     start_router();
     start_server();
     start_client();
-    uart_irq_callback_user_data_set(uart_dev, uart_csp_rx, NULL);
-    uart_irq_rx_enable(uart_dev);
 
     // Do forever
     while (1) {
