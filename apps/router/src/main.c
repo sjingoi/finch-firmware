@@ -6,12 +6,18 @@
 #include <zephyr/sys/printk.h>
 #include <csp/csp.h>
 #include <csp/interfaces/csp_if_kiss.h>
-#include <csp/drivers/usart.h>
+
+#define UART_ADDR 5
+#define UART_RX_CBUF_LEN 32
+
+static csp_iface_t kiss_iface = {0};
+static csp_kiss_interface_data_t kiss_ifdata = {0};
+static uint8_t uart_rx_cbuf[UART_RX_CBUF_LEN];
+static int uart_rx_cbuf_len = 0;
 
 #define SW0_NODE DT_ALIAS(sw0)
 #define UART_NODE DT_NODELABEL(usart1)
 #define SERVER_PORT 10
-#define UART_BAUDRATE 115200
 
 static const int32_t sleep_time_ms = 100;
 
@@ -42,6 +48,67 @@ void csp_print_func(const char *fmt, ...) {
     va_start(args, fmt);
     vprintk(fmt, args);
     va_end(args);
+}
+
+/* KISS "driver" tx: writes framed bytes straight out over the UART. */
+static int uart_kiss_tx(void *driver_data, const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        uart_poll_out(uart_dev, data[i]);
+    }
+    return CSP_ERR_NONE;
+}
+
+/* Interrupt-driven UART RX: drains whatever the hardware has right now and
+ * hands it straight to the KISS decoder. This replaces libcsp's stock
+ * poll-in-a-thread driver, which sleeps between polls for at least one
+ * kernel tick (100us here) with no RX FIFO behind it - long enough to lose
+ * bytes arriving at 115200 baud (~8.7us/byte) whenever the poll loop wasn't
+ * actively spinning. Draining directly from the ISR means we never leave
+ * the single RX data register unread between bytes. */
+static void uart_rx_isr(const struct device *dev, void *user_data) {
+    while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
+        uint8_t byte;
+        int n = uart_fifo_read(dev, &byte, 1);
+        if (n <= 0) {
+            break;
+        }
+
+        uart_rx_cbuf[uart_rx_cbuf_len++] = byte;
+        if (uart_rx_cbuf_len >= UART_RX_CBUF_LEN) {
+            csp_kiss_rx(&kiss_iface, uart_rx_cbuf, uart_rx_cbuf_len, (void *)1);
+            uart_rx_cbuf_len = 0;
+        }
+    }
+
+    /* Hand off whatever came in on this interrupt; the next byte raises a
+     * new interrupt so there's no need to wait for an idle line. */
+    if (uart_rx_cbuf_len > 0) {
+        csp_kiss_rx(&kiss_iface, uart_rx_cbuf, uart_rx_cbuf_len, (void *)1);
+        uart_rx_cbuf_len = 0;
+    }
+}
+
+static int setup_uart_kiss_interface(csp_iface_t **return_iface) {
+    kiss_iface.name = "uart";
+    kiss_iface.addr = UART_ADDR;
+    kiss_iface.interface_data = &kiss_ifdata;
+    kiss_ifdata.tx_func = uart_kiss_tx;
+
+    int res = csp_kiss_add_interface(&kiss_iface);
+    if (res != CSP_ERR_NONE) {
+        return res;
+    }
+
+    uart_irq_rx_disable(uart_dev);
+    uart_irq_tx_disable(uart_dev);
+    uart_irq_callback_user_data_set(uart_dev, uart_rx_isr, NULL);
+    uart_irq_rx_enable(uart_dev);
+
+    if (return_iface) {
+        *return_iface = &kiss_iface;
+    }
+
+    return CSP_ERR_NONE;
 }
 
 void task_router(void *p1, void *p2, void *p3) {
@@ -151,14 +218,7 @@ int main(void) {
 
     csp_init();
 
-    csp_usart_conf_t uart_conf = {
-        .device = uart_dev->name,
-		.baudrate = UART_BAUDRATE,
-		.databits = 8,
-		.stopbits = 1,
-		.paritysetting = 0,
-	};
-    csp_usart_open_and_add_kiss_interface(&uart_conf, "uart", 5, &iface);
+    setup_uart_kiss_interface(&iface);
     iface->is_default = 1;
 
     start_router();
